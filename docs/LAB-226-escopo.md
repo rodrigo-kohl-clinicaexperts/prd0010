@@ -132,6 +132,14 @@ Conforme cronograma e PDF de referência:
 - [ ] Modelo de IA selecionado e fallback — **depende do benchmark deste repo** (`1_download_data.py` → `5_visualize.py`).
 - [ ] **LLM as a judge** para avaliação de qualidade clínica — métricas atuais do `3_score.py` (bge-m3 dense/sparse, e5, BERTScore) medem similaridade lexical/semântica vs. referência, o que é insuficiente para julgar correção clínica, aderência ao formato estruturado do LAB-230 (achados / sugestões / pontos de atenção / limites / aviso final) e ausência de alucinação. Decidir: (a) modelo-juiz e rubrica (correção factual, completude, segurança, formato, tom de apoio à decisão); (b) se roda offline no benchmark, online sobre `response_received` amostrado, ou ambos; (c) calibração contra avaliação humana de uma amostra antes de adotar como gate de release.
 - [ ] Política de retenção do histórico do chat clínico (sessão? atendimento? auditável por quanto tempo?).
+- [ ] **Impacto do redesign do prontuário no entry point** — observação de João Libio (28/12/2025):
+  > No relayout do prontuário, poderemos fazer anotações, preencher fichas diretamente no ambiente do paciente, neste caso, o funcionamento será o mesmo? O botão do assistente clínico, vai ficar disponível apenas na tela do prontuário/atendimento?
+  >
+  > A ideia do redesign do prontuário é torná-lo mais simples e intuitivo, onde não preciso criar um atendimento para isso, mas sim, já ir realizando as ações que o profissional da saúde necessita para a consulta/procedimento executado. Acredito que tenha impacto.
+  >
+  > Sugestão para avaliarmos: nesta tela (prontuário/atendimento) o profissional da saúde pode chamar a Anna Assistent, contudo, o que será aberto no drawer lateral, nesta tela sempre será o assistente clínico. Penso que devemos manter a feature da assistent com comportamento igual em todo o sistema.
+
+  Afeta a regra "atendimento ativo" do §4 e o item F4 do §3 — revisitar com produto antes de fechar LAB-227.
 
 ---
 
