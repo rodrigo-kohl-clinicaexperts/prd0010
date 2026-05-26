@@ -33,3 +33,20 @@ async def call_once(
 
 async def close_client(client) -> None:
     await client.close()
+
+
+# OpenRouter ainda não expõe Batch API equivalente a OpenAI/Anthropic/Gemini.
+def supports_batch() -> bool:
+    return False
+
+
+async def submit_batch(*args, **kwargs):
+    raise NotImplementedError("OpenRouter não tem batch API")
+
+
+async def poll_batch(*args, **kwargs):
+    raise NotImplementedError("OpenRouter não tem batch API")
+
+
+async def fetch_batch(*args, **kwargs):
+    raise NotImplementedError("OpenRouter não tem batch API")

@@ -3,6 +3,7 @@ import json
 import asyncio
 import hashlib
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -60,7 +61,7 @@ MODELS = {
         "model": "gemini-2.5-flash",
         "kind": "gemini",
     },
-    # MedGemma não está disponível na Gemini API pública — requer RunPod
+    #MedGemma não está disponível na Gemini API pública — requer RunPod
     # "medgemma-4b-it": {
     #     "runpod_endpoint_env": "RUNPOD_MEDGEMMA_4B_ENDPOINT",
     #     "api_key_env": "RUNPOD_API_KEY",
@@ -245,6 +246,230 @@ def purge_stale(out_path, current_hashes):
 
 
 # --------------------------------------------------------------------------
+# Batch API — estado persistente em data/batches.jsonl
+# --------------------------------------------------------------------------
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def load_batches() -> dict:
+    """
+    Lê data/batches.jsonl, retorna dict batch_id -> entry (última versão).
+    Append-only: linhas com mesmo batch_id sobrescrevem em memória.
+    """
+    path = DATA / "batches.jsonl"
+    if not path.exists():
+        return {}
+    entries = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            entries[r["batch_id"]] = r
+    return entries
+
+
+def append_batch(entry: dict) -> None:
+    path = DATA / "batches.jsonl"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+def items_in_pending_batches(batches: dict, current_hashes: dict) -> set:
+    """(id, model) que estão num batch ainda não-fetchado da config atual."""
+    in_flight = set()
+    for entry in batches.values():
+        if entry["status"] in ("fetched", "failed"):
+            continue
+        model = entry["model_name"]
+        if entry["config_hash"] != current_hashes.get(model):
+            continue
+        for iid in entry["item_ids"]:
+            in_flight.add((int(iid), model))
+    return in_flight
+
+
+def _parse_item_id(custom_id: str) -> int:
+    """custom_id formato 'item_<id>' -> int."""
+    return int(custom_id.removeprefix("item_"))
+
+
+async def submit_batches(eval_set, models_to_run, current_hashes):
+    out_path = DATA / "generations.jsonl"
+    done = load_done(out_path, current_hashes)
+    batches = load_batches()
+    in_flight = items_in_pending_batches(batches, current_hashes)
+
+    if done:
+        print(f"  já gerados (config atual): {len(done)}")
+    if in_flight:
+        print(f"  em batch pendente: {len(in_flight)}")
+
+    for name in models_to_run:
+        spec = MODELS[name]
+        kind = spec["kind"]
+        maker = MAKERS[kind]
+
+        if not maker.supports_batch():
+            print(f"\n=== [{kind}] {name}: provider sem batch API — pulando")
+            continue
+
+        pending = [
+            it for it in eval_set
+            if (it["id"], name) not in done
+            and (it["id"], name) not in in_flight
+        ]
+        print(f"\n=== [{kind}] {name} ({spec['model']}): "
+              f"{len(pending)} a submeter ===")
+
+        if not pending:
+            continue
+
+        client = maker.make_client(spec, REQUEST_TIMEOUT[kind])
+        try:
+            batch_id = await maker.submit_batch(
+                client, name, spec, pending,
+                SYSTEM_PROMPT, TEMPERATURE, MAX_TOKENS,
+            )
+        finally:
+            await maker.close_client(client)
+
+        append_batch({
+            "batch_id": batch_id,
+            "provider": kind,
+            "model_name": name,
+            "config_hash": current_hashes[name],
+            "item_ids": [int(it["id"]) for it in pending],
+            "submitted_at": _iso_now(),
+            "status": "submitted",
+            "fetched_at": None,
+        })
+        print(f"  submetido: {batch_id}")
+
+
+async def poll_pending_batches() -> dict:
+    """Polla todos os batches não-terminais. Retorna o snapshot novo."""
+    batches = load_batches()
+    pending_ids = [bid for bid, e in batches.items()
+                   if e["status"] in ("submitted", "done")]
+    if not pending_ids:
+        print("  nenhum batch pendente.")
+        return batches
+
+    for bid in pending_ids:
+        entry = batches[bid]
+        kind = entry["provider"]
+        name = entry["model_name"]
+        spec = MODELS.get(name)
+        if spec is None:
+            print(f"  {name} [{bid}]: modelo não está mais em MODELS — pulando")
+            continue
+        maker = MAKERS[kind]
+
+        client = maker.make_client(spec, REQUEST_TIMEOUT[kind])
+        try:
+            info = await maker.poll_batch(client, bid)
+        finally:
+            await maker.close_client(client)
+
+        new_status = info["status"]
+        new_state = {
+            "pending": "submitted",
+            "done": "done",
+            "failed": "failed",
+        }[new_status]
+        if new_state != entry["status"]:
+            print(f"  {name} [{bid}]: {entry['status']} → {new_state}")
+            entry = dict(entry)
+            entry["status"] = new_state
+            append_batch(entry)
+            batches[bid] = entry
+        else:
+            print(f"  {name} [{bid}]: {entry['status']}")
+    return batches
+
+
+async def fetch_completed_batches(eval_set, current_hashes):
+    """Para batches com status=done, baixa resultados e dá append em generations.jsonl."""
+    batches = load_batches()
+    todo = [(bid, e) for bid, e in batches.items() if e["status"] == "done"]
+    if not todo:
+        print("  nenhum batch pronto pra fetch.")
+        return
+
+    eval_by_id = {int(it["id"]): it for it in eval_set}
+    out_path = DATA / "generations.jsonl"
+
+    with open(out_path, "a", encoding="utf-8") as fout:
+        for bid, entry in todo:
+            kind = entry["provider"]
+            name = entry["model_name"]
+            spec = MODELS.get(name)
+            if spec is None:
+                print(f"  {name} [{bid}]: modelo não está mais em MODELS — pulando")
+                continue
+            maker = MAKERS[kind]
+
+            client = maker.make_client(spec, REQUEST_TIMEOUT[kind])
+            try:
+                results = await maker.fetch_batch(client, bid)
+            finally:
+                await maker.close_client(client)
+
+            n_ok = 0
+            n_err = 0
+            for r in results:
+                try:
+                    item_id = _parse_item_id(r["custom_id"])
+                except ValueError:
+                    print(f"  custom_id inválido: {r['custom_id']} — ignorando")
+                    continue
+                item = eval_by_id.get(item_id)
+                if item is None:
+                    print(f"  item id={item_id} não está mais no eval_set — pulando")
+                    continue
+                if r["error"]:
+                    gen = f"__ERRO__: {r['error']}"
+                    n_err += 1
+                else:
+                    gen = r["generation"]
+                    n_ok += 1
+                rec = {
+                    "id": item_id,
+                    "model": name,
+                    "question": item["question"],
+                    "reference": item["answer"],
+                    "generation": gen,
+                    "provider_used": r["provider_used"],
+                    "config_hash": entry["config_hash"],
+                }
+                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fout.flush()
+            print(f"  {name} [{bid}]: fetched {n_ok} ok, {n_err} erro(s)")
+
+            entry = dict(entry)
+            entry["status"] = "fetched"
+            entry["fetched_at"] = _iso_now()
+            append_batch(entry)
+
+
+async def wait_until_all_done(poll_interval: int = 300):
+    """Polla em loop até nenhum batch estar em 'submitted'."""
+    while True:
+        batches = await poll_pending_batches()
+        ainda = [b for b in batches.values() if b["status"] == "submitted"]
+        if not ainda:
+            return
+        print(f"  ainda processando: {len(ainda)} batch(es). "
+              f"Próximo poll em {poll_interval}s.")
+        await asyncio.sleep(poll_interval)
+
+
+# --------------------------------------------------------------------------
 # Geração de um modelo (async)
 # --------------------------------------------------------------------------
 
@@ -344,6 +569,39 @@ async def main_async(args):
     models_to_run = args.models or list(MODELS.keys())
     print(f"Modelos a rodar: {models_to_run}")
 
+    current_hashes = {
+        name: config_fingerprint(MODELS[name]["model"]) for name in MODELS
+    }
+    for name in models_to_run:
+        print(f"  config_hash[{name}] = {current_hashes[name]}")
+
+    out_path = DATA / "generations.jsonl"
+
+    if args.purge_stale:
+        print("\n--purge-stale: limpando linhas de config antiga...")
+        purge_stale(out_path, current_hashes)
+
+    # --- modos batch (sem retomada/concorrência sync) ---
+    if args.batch == "submit":
+        print("\n=== batch submit ===")
+        await submit_batches(eval_set, models_to_run, current_hashes)
+        return
+    if args.batch == "poll":
+        print("\n=== batch poll ===")
+        await poll_pending_batches()
+        return
+    if args.batch == "fetch":
+        print("\n=== batch fetch ===")
+        await poll_pending_batches()
+        await fetch_completed_batches(eval_set, current_hashes)
+        return
+    if args.batch == "wait":
+        print("\n=== batch wait ===")
+        await wait_until_all_done(poll_interval=args.poll_interval)
+        await fetch_completed_batches(eval_set, current_hashes)
+        return
+
+    # --- modo sync (default) ---
     concurrency = {
         "openai":     args.concurrency_openai,
         "openrouter": args.concurrency_openrouter,
@@ -358,18 +616,6 @@ async def main_async(args):
         f"Anthropic={concurrency['anthropic']}, "
         f"Gemini={concurrency['gemini']}"
     )
-
-    current_hashes = {
-        name: config_fingerprint(MODELS[name]["model"]) for name in MODELS
-    }
-    for name in models_to_run:
-        print(f"  config_hash[{name}] = {current_hashes[name]}")
-
-    out_path = DATA / "generations.jsonl"
-
-    if args.purge_stale:
-        print("\n--purge-stale: limpando linhas de config antiga...")
-        purge_stale(out_path, current_hashes)
 
     done = load_done(out_path, current_hashes)
     if done:
@@ -411,6 +657,16 @@ if __name__ == "__main__":
     p.add_argument("--purge-stale", action="store_true",
                    help="antes de rodar, remove do generations.jsonl as linhas "
                         "de config antiga (prompt/versão/parâmetros que mudaram)")
+    p.add_argument("--batch", choices=["submit", "poll", "fetch", "wait"],
+                   nargs="?", const="wait", default=None,
+                   help="modo batch (50%% desconto, SLA 24h). "
+                        "submit: envia pendentes; poll: checa status; "
+                        "fetch: baixa prontos e dá append em generations.jsonl; "
+                        "wait: poll em loop até tudo pronto, depois fetch "
+                        "(default quando --batch é passado sem valor).")
+    p.add_argument("--poll-interval", type=int, default=300,
+                   help="intervalo de poll (segundos) no modo --batch wait. "
+                        "default: 300")
     p.add_argument("--concurrency-openai", type=int,
                    default=DEFAULT_CONCURRENCY["openai"],
                    help=f"chamadas em paralelo para OpenAI SDK "

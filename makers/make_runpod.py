@@ -42,3 +42,20 @@ async def call_once(
 
 async def close_client(client) -> None:
     await client.close()
+
+
+# RunPod expõe endpoint OpenAI-compatible mas sem batch processing.
+def supports_batch() -> bool:
+    return False
+
+
+async def submit_batch(*args, **kwargs):
+    raise NotImplementedError("RunPod não tem batch API")
+
+
+async def poll_batch(*args, **kwargs):
+    raise NotImplementedError("RunPod não tem batch API")
+
+
+async def fetch_batch(*args, **kwargs):
+    raise NotImplementedError("RunPod não tem batch API")
