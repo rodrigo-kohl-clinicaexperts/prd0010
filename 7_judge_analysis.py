@@ -74,11 +74,27 @@ def load_embedding_report():
 # Agregações
 # --------------------------------------------------------------------------
 
-def per_question_ensemble(rows_scored):
-    """{(id, judged_model): mean_score across all judges}. Já é o 'ensemble'."""
-    bucket = defaultdict(list)
+def dedup_by_triple(rows_scored):
+    """
+    Colapsa duplicatas em (id, judged_model, judge_model) tirando MÉDIA dos
+    scores. judgments.jsonl é append-only; retries deixam várias linhas pro
+    mesmo trio. Sem isso, o juiz que falhou mais (e foi re-julgado mais
+    vezes) ganha peso indevido em todas as agregações.
+
+    Devolve {(id, judged_model, judge_model): mean_score}.
+    """
+    triple = defaultdict(list)
     for r in rows_scored:
-        bucket[(int(r["id"]), r["judged_model"])].append(float(r["score"]))
+        key = (int(r["id"]), r["judged_model"], r["judge_model"])
+        triple[key].append(float(r["score"]))
+    return {k: float(np.mean(v)) for k, v in triple.items()}
+
+
+def per_question_ensemble(dedup):
+    """{(id, judged_model): média entre juízes}. Consome dedup_by_triple."""
+    bucket = defaultdict(list)
+    for (id_, judged, _judge), s in dedup.items():
+        bucket[(id_, judged)].append(s)
     return {k: float(np.mean(v)) for k, v in bucket.items()}
 
 
@@ -100,55 +116,78 @@ def breakdown_by_question_type(per_q, qtype_by_id):
             for qt, d in by.items()}
 
 
-def per_judge_stats(all_rows):
-    """Auditoria de calibração de cada juiz: média, n, taxa de parse_fail."""
-    by_judge = defaultdict(lambda: {"scores": [], "total": 0, "fails": 0})
+def per_judge_stats(all_rows, dedup):
+    """
+    Por juiz:
+    - n / mean_score / std_score: vêm do `dedup` (uma score por trio, sem
+      duplicatas — representa o universo real de julgamentos únicos).
+    - parse_fail_rate: vem dos rows crus (cada tentativa de batch conta como
+      uma chance de falhar — é taxa por chamada, não por trio).
+    """
+    # stats limpos vindo do dedup
+    scores_by_judge = defaultdict(list)
+    for (_id, _judged, judge), s in dedup.items():
+        scores_by_judge[judge].append(s)
+    # parse fail rate cru
+    raw_counts = defaultdict(lambda: {"total": 0, "fails": 0})
     for r in all_rows:
         j = r["judge_model"]
-        by_judge[j]["total"] += 1
-        s = r.get("score")
-        if s is None:
-            by_judge[j]["fails"] += 1
-        else:
-            by_judge[j]["scores"].append(float(s))
+        raw_counts[j]["total"] += 1
+        if r.get("score") is None:
+            raw_counts[j]["fails"] += 1
+    judges = set(scores_by_judge) | set(raw_counts)
     out = {}
-    for j, d in by_judge.items():
-        n = len(d["scores"])
+    for j in judges:
+        scores = scores_by_judge.get(j, [])
+        rc = raw_counts.get(j, {"total": 0, "fails": 0})
+        n = len(scores)
         out[j] = {
             "n": n,
-            "mean_score": float(np.mean(d["scores"])) if n else None,
-            "std_score": float(np.std(d["scores"])) if n else None,
-            "parse_fail_rate": d["fails"] / d["total"] if d["total"] else 0.0,
+            "mean_score": float(np.mean(scores)) if n else None,
+            "std_score": float(np.std(scores)) if n else None,
+            "parse_fail_rate": rc["fails"] / rc["total"] if rc["total"] else 0.0,
+            "n_raw_attempts": rc["total"],
         }
     return out
 
 
-def inter_judge_agreement(rows_scored):
+def inter_judge_agreement(dedup, min_pairs: int = 30):
     """
-    Para cada par de juízes: Spearman entre os rankings de modelos julgados.
-    Cada juiz produz {judged_model: mean_score}; correlacionamos os rankings.
+    Spearman entre juízes ao nível (id, judged_model): pra cada par, conta
+    todos os (id, judged) que AMBOS julgaram e correlaciona os scores. Mais
+    robusto que correlacionar rankings de modelos — esse seria limitado pela
+    interseção de quem julgou quem (frequentemente <3 modelos comuns), aqui
+    cada par compartilha centenas/milhares de itens.
+
+    Também devolve {judge: {judged_model: mean_score}} (usado em outras
+    seções do report, ex.: figura de calibração).
     """
-    by_judge = defaultdict(lambda: defaultdict(list))
-    for r in rows_scored:
-        by_judge[r["judge_model"]][r["judged_model"]].append(float(r["score"]))
+    # nível item-a-item: {judge: {(id, judged): score}}
+    by_judge_item = defaultdict(dict)
+    # nível ranking (info auxiliar pra JSON e outras agregações)
+    by_judge_model = defaultdict(lambda: defaultdict(list))
+    for (id_, judged, judge), s in dedup.items():
+        by_judge_item[judge][(id_, judged)] = s
+        by_judge_model[judge][judged].append(s)
+
     means_by_judge = {
         j: {m: float(np.mean(v)) for m, v in d.items()}
-        for j, d in by_judge.items()
+        for j, d in by_judge_model.items()
     }
-    judges = sorted(means_by_judge)
+    judges = sorted(by_judge_item)
     pares = []
     for i in range(len(judges)):
         for k in range(i + 1, len(judges)):
             j1, j2 = judges[i], judges[k]
-            common = sorted(set(means_by_judge[j1]) & set(means_by_judge[j2]))
-            if len(common) < 3:
+            common = sorted(set(by_judge_item[j1]) & set(by_judge_item[j2]))
+            if len(common) < min_pairs:
                 continue
-            v1 = [means_by_judge[j1][m] for m in common]
-            v2 = [means_by_judge[j2][m] for m in common]
+            v1 = [by_judge_item[j1][key] for key in common]
+            v2 = [by_judge_item[j2][key] for key in common]
             rho, _ = spearmanr(v1, v2)
             pares.append({
                 "judge_a": j1, "judge_b": j2,
-                "spearman": float(rho), "n_models": len(common),
+                "spearman": float(rho), "n_pairs": len(common),
             })
     return pares, means_by_judge
 
@@ -318,11 +357,16 @@ def main(args):
     embed_report = load_embedding_report()
 
     print("\nAgregando...")
-    per_q = per_question_ensemble(rows_scored)
+    dedup = dedup_by_triple(rows_scored)
+    n_dups = len(rows_scored) - len(dedup)
+    if n_dups:
+        print(f"  dedup: {len(rows_scored)} linhas → {len(dedup)} trios únicos "
+              f"({n_dups} duplicatas colapsadas pela média)")
+    per_q = per_question_ensemble(dedup)
     judge_means = mean_by_judged_model(per_q)
     breakdown = breakdown_by_question_type(per_q, qtype_by_id)
-    judge_stats = per_judge_stats(all_rows)
-    inter_pairs, judge_x_model_means = inter_judge_agreement(rows_scored)
+    judge_stats = per_judge_stats(all_rows, dedup)
+    inter_pairs, judge_x_model_means = inter_judge_agreement(dedup)
     cross_corr = cross_correlation_with_embedding(judge_means, embed_report)
 
     print("\n=== Média ensemble por modelo ===")
@@ -334,14 +378,16 @@ def main(args):
         mean = s["mean_score"]
         ms = f"{mean:.2f}" if mean is not None else "—"
         print(f"  {j:<22} n={s['n']:>5}  média={ms:<6}  "
-              f"parse_fail={s['parse_fail_rate']*100:.1f}%")
+              f"parse_fail={s['parse_fail_rate']*100:>5.1f}%  "
+              f"(de {s['n_raw_attempts']} tentativas crus)")
 
     if inter_pairs:
-        print("\n=== Concordância entre juízes (Spearman) ===")
+        print("\n=== Concordância entre juízes (Spearman item-a-item) ===")
         for p in inter_pairs:
             flag = "OK" if p["spearman"] >= 0.7 else "atenção"
             print(f"  {p['judge_a']:<22} vs {p['judge_b']:<22} "
-                  f"rho={p['spearman']:+.3f} [{flag}]")
+                  f"rho={p['spearman']:+.3f}  "
+                  f"(n_pares={p['n_pairs']:>5}) [{flag}]")
 
     if cross_corr:
         print("\n=== Juiz vs embedding (Spearman) ===")

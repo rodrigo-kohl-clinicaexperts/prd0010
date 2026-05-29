@@ -256,44 +256,112 @@ def load_done_judgments(cfg_hash):
 # --------------------------------------------------------------------------
 
 _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
+# fallback: pega "score": <int> mesmo se o JSON estiver truncado/aberto.
+# Tolera variações de whitespace e aspas opcionais na chave.
+_SCORE_RE = re.compile(r'"?score"?\s*:\s*(\d+)', re.IGNORECASE)
+# fallback: pega a parte da rationale que sobreviveu (até o truncamento).
+_RATIONALE_PARTIAL_RE = re.compile(
+    r'"?rationale"?\s*:\s*"(.*?)(?:"|$)', re.IGNORECASE | re.DOTALL)
 
 
 def parse_judge_output(text: str):
     """
     Tenta extrair {"score": int 0-10, "rationale": str}. Devolve
-    (score|None, rationale|""). Tolera cercas de código markdown e texto extra.
+    (score|None, rationale|""). Camadas, em ordem:
+      1. JSON direto.
+      2. Primeiro {...} bem formado dentro do texto.
+      3. Regex no score (resgata JSON truncado: max_tokens cortou no meio
+         da rationale, mas o score já saiu inteiro). rationale recuperada
+         em best-effort até o truncamento.
     """
     if not text:
         return None, ""
-    # remove cerca de código se vier
     clean = text.strip()
     if clean.startswith("```"):
         clean = re.sub(r"^```[a-zA-Z]*\n?", "", clean)
         clean = re.sub(r"\n?```\s*$", "", clean)
-    # tenta parse direto
+
     obj = None
     try:
         obj = json.loads(clean)
     except json.JSONDecodeError:
-        # tenta extrair o primeiro {...} guloso (cobre texto antes/depois)
         m = _JSON_OBJ_RE.search(clean)
         if m:
             try:
                 obj = json.loads(m.group(0))
             except json.JSONDecodeError:
                 pass
-    if not isinstance(obj, dict):
-        return None, ""
-    score = obj.get("score")
-    rationale = obj.get("rationale", "")
-    if isinstance(score, bool):  # bool é int em Python, blindar
-        return None, str(rationale)
-    if not isinstance(score, (int, float)):
-        return None, str(rationale)
-    score = int(round(score))
-    if not (0 <= score <= 10):
-        return None, str(rationale)
-    return score, str(rationale)
+
+    if isinstance(obj, dict):
+        score = obj.get("score")
+        rationale = obj.get("rationale", "")
+        if not isinstance(score, bool) and isinstance(score, (int, float)):
+            si = int(round(score))
+            if 0 <= si <= 10:
+                return si, str(rationale)
+
+    # ---- fallback regex (truncamento) ----
+    m = _SCORE_RE.search(clean)
+    if m:
+        try:
+            si = int(m.group(1))
+        except ValueError:
+            return None, ""
+        if 0 <= si <= 10:
+            rationale = ""
+            mr = _RATIONALE_PARTIAL_RE.search(clean)
+            if mr:
+                rationale = mr.group(1)  # parcial OK
+            return si, rationale
+    return None, ""
+
+
+def repair_judgments():
+    """
+    Reprocessa data/judgments.jsonl in-place: reaplica parse_judge_output em
+    entries com score=None (exceto provider errors). Útil quando o parser
+    melhora e você quer resgatar julgamentos antigos SEM re-chamar API
+    (config_hash não muda, então a próxima execução não tenta refazer).
+    Escreve em .tmp e renomeia (atômico).
+    """
+    path = DATA / "judgments.jsonl"
+    if not path.exists():
+        print("  nada a reparar (judgments.jsonl não existe).")
+        return
+    tmp = path.with_suffix(".jsonl.tmp")
+    n_total = n_already_ok = n_provider_err = n_repaired = n_still_fail = 0
+    with open(path, encoding="utf-8") as fin, \
+         open(tmp, "w", encoding="utf-8") as fout:
+        for line in fin:
+            n_total += 1
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                fout.write(line)  # preserva linha estranha como veio
+                continue
+            if r.get("score") is not None:
+                n_already_ok += 1
+                fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+                continue
+            raw = r.get("raw_judge_output") or ""
+            if raw.startswith("__ERRO__"):
+                n_provider_err += 1
+                fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+                continue
+            score, rationale = parse_judge_output(raw)
+            if score is not None:
+                r["score"] = score
+                r["rationale"] = rationale
+                n_repaired += 1
+            else:
+                n_still_fail += 1
+            fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+    print(f"  total:           {n_total}")
+    print(f"  já estavam ok:   {n_already_ok}")
+    print(f"  provider errors: {n_provider_err}  (não resgatáveis sem re-rodar)")
+    print(f"  reparados agora: {n_repaired}")
+    print(f"  ainda perdidos:  {n_still_fail}")
 
 
 # --------------------------------------------------------------------------
@@ -528,7 +596,34 @@ async def fetch_completed_judge_batches():
             finally:
                 await maker.close_client(client)
 
-            n_ok, n_err = 0, 0
+            # categorias de erro pra diagnóstico:
+            #   provider: API do batch devolveu erro (refusal, rate, etc)
+            #   truncated: output válido mas cortado (não fecha JSON) -> max_tokens baixo
+            #   malformed: termina em '}' mas não parseia -> JSON realmente quebrado
+            #   no_score: parseia mas 'score' ausente/fora de [0,10]
+            stats = {"ok": 0, "provider": 0, "truncated": 0,
+                     "malformed": 0, "no_score": 0}
+            samples = {"provider": None, "truncated": None,
+                       "malformed": None, "no_score": None}
+
+            def _classify(raw_text: str) -> str:
+                stripped = raw_text.strip()
+                if stripped.startswith("```"):
+                    stripped = stripped.rstrip("`").rstrip()
+                if not stripped.endswith("}"):
+                    return "truncated"
+                # tenta parse; se vier dict sem score válido -> no_score
+                try:
+                    obj = json.loads(stripped)
+                    if isinstance(obj, dict):
+                        s = obj.get("score")
+                        if isinstance(s, (int, float)) and 0 <= s <= 10:
+                            return "no_score"  # parseou mas algo zoado
+                        return "no_score"
+                    return "malformed"
+                except json.JSONDecodeError:
+                    return "malformed"
+
             for r in results:
                 cid = r["custom_id"]
                 try:
@@ -538,17 +633,19 @@ async def fetch_completed_judge_batches():
                     print(f"  custom_id inválido: {cid} — ignorando")
                     continue
 
+                score, rationale, cat = None, "", "ok"
                 if r["error"]:
-                    score, rationale = None, ""
                     raw = f"__ERRO__: {r['error']}"
-                    n_err += 1
+                    cat = "provider"
                 else:
                     raw = r["generation"] or ""
                     score, rationale = parse_judge_output(raw)
                     if score is None:
-                        n_err += 1
-                    else:
-                        n_ok += 1
+                        cat = _classify(raw)
+
+                stats[cat] += 1
+                if cat != "ok" and samples[cat] is None:
+                    samples[cat] = raw[:200]
 
                 rec = {
                     "id": int(pair["id"]),
@@ -562,7 +659,15 @@ async def fetch_completed_judge_batches():
                 }
                 fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fout.flush()
-            print(f"  {judge_name} [{bid}]: fetched {n_ok} ok, {n_err} erro(s)")
+            n_err = sum(v for k, v in stats.items() if k != "ok")
+            print(f"  {judge_name} [{bid}]: fetched {stats['ok']} ok, "
+                  f"{n_err} erro(s)  [provider={stats['provider']} "
+                  f"truncated={stats['truncated']} "
+                  f"malformed={stats['malformed']} "
+                  f"no_score={stats['no_score']}]")
+            for cat, sample in samples.items():
+                if sample is not None:
+                    print(f"    amostra [{cat}]: {sample!r}")
 
             entry = dict(entry)
             entry["status"] = "fetched"
@@ -640,6 +745,11 @@ def build_pairs_by_judge(sample_ids, generations, models_to_judge,
 
 
 async def main_async(args):
+    if args.repair:
+        print("=== repair: reprocessando judgments.jsonl com parser atual ===")
+        repair_judgments()
+        return
+
     eval_set = load_eval_set()
     qtype_by_id = load_question_types()
     print(f"eval_set: {len(eval_set)} questões")
@@ -771,11 +881,16 @@ if __name__ == "__main__":
                         "com mesmo seed mantém os IDs antigos). default: 42")
     p.add_argument("--force-sample", action="store_true",
                    help="ignora data/judge_sample.json e regenera a amostra")
+    p.add_argument("--repair", action="store_true",
+                   help="reprocessa data/judgments.jsonl in-place: reaplica o "
+                        "parser nas entries com score=None (sem chamar API, "
+                        "sem mexer em config_hash). Útil pra resgatar "
+                        "julgamentos truncados depois de melhorar o parser.")
     p.add_argument("--models", nargs="*", choices=list(MODELS.keys()),
                    help="quais modelos julgar (default: todos do pool)")
-    p.add_argument("--max-judges-per-kind", type=int, default=2,
+    p.add_argument("--max-judges-per-kind", type=int, default=0,
                    help="capa quantos juízes por kind (ex: 2 evita que 3 gpts "
-                        "dominem o ensemble). default: 2. 0 ou negativo = sem cap.")
+                        "dominem o ensemble). default: 0. 0 ou negativo = sem cap.")
     p.add_argument("--batch", choices=["submit", "poll", "fetch", "wait"],
                    nargs="?", const="wait", default=None,
                    help="modo batch (50%% desconto, SLA 24-48h). "
