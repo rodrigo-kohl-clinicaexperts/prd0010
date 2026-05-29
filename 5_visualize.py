@@ -80,32 +80,58 @@ def fig_spearman_heatmap(report):
     return fig
 
 
-def fig_breakdown_heatmap(report):
-    """Heatmap modelo × question_type."""
-    breakdown = report.get("breakdown_by_question_type", {})
-    if not breakdown:
-        return None
-    qtypes = list(breakdown.keys())
-    models = sorted({m for d in breakdown.values() for m in d})
+def figs_breakdown_heatmaps(report):
+    """Uma heatmap modelo × question_type POR métrica, com coluna TOTAL
+    (média global do modelo naquela métrica, vinda de means_by_metric —
+    é a ponderada correta, não a média das colunas).
 
-    # z[modelo][tipo]
-    z = [[breakdown[qt].get(model) for qt in qtypes] for model in models]
+    Métricas vivem em escalas diferentes, então cada heatmap tem seu próprio
+    colorscale honesto. A primária aparece em primeiro lugar.
+    """
+    breakdowns = report.get("breakdowns_by_metric", {})
+    if not breakdowns:
+        return []
+    means_by_metric = report.get("means_by_metric", {})
+    primary = report.get("primary_metric")
 
-    fig = go.Figure(data=go.Heatmap(
-        z=z,
-        x=qtypes,
-        y=models,
-        colorscale="Viridis",
-        text=[[f"{v:.3f}" if v is not None else "" for v in row] for row in z],
-        texttemplate="%{text}",
-        colorbar=dict(title="similaridade"),
-    ))
-    fig.update_layout(
-        title="Desempenho por question_type (métrica primária)",
-        xaxis_title="question_type",
-        yaxis_title="modelo",
+    # primária primeiro, depois as demais em ordem alfabética estável
+    metrics_ordered = (
+        ([primary] if primary in breakdowns else []) +
+        [m for m in sorted(breakdowns) if m != primary]
     )
-    return fig
+
+    figs = []
+    for metric in metrics_ordered:
+        breakdown = breakdowns[metric]
+        qtypes = list(breakdown.keys())
+        models = sorted({m for d in breakdown.values() for m in d})
+        totals = means_by_metric.get(metric, {})
+
+        columns = qtypes + ["TOTAL"]
+        z = [
+            [breakdown[qt].get(model) for qt in qtypes] + [totals.get(model)]
+            for model in models
+        ]
+        is_primary = (metric == primary)
+        suffix = " — primária" if is_primary else ""
+        fig = go.Figure(data=go.Heatmap(
+            z=z,
+            x=columns,
+            y=models,
+            colorscale="Viridis",
+            text=[[f"{v:.3f}" if v is not None else "" for v in row] for row in z],
+            texttemplate="%{text}",
+            colorbar=dict(title=metric),
+        ))
+        fig.add_vline(x=len(qtypes) - 0.5, line_width=2, line_color="white")
+        fig.update_layout(
+            title=f"Desempenho por question_type — métrica: {metric}{suffix} "
+                  "(coluna TOTAL = média global do modelo)",
+            xaxis_title="question_type",
+            yaxis_title="modelo",
+        )
+        figs.append(fig)
+    return figs
 
 
 def fig_completeness(report):
@@ -139,18 +165,29 @@ def fig_completeness(report):
 
 # --------------------------------------------------------------------------
 
-def build_dashboard(report):
+def build_dashboard(report, extra_figs=None, extra_header_html=None,
+                    extra_meta=None):
     """
-    Monta um HTML único com todos os painéis empilhados. Cada figura vira uma
-    div; concatenamos no mesmo arquivo. Plotly embute o JS na primeira figura
-    (include_plotlyjs) e as demais reusam.
+    HTML único com painéis de embedding empilhados. Aceita figuras extras
+    (lista de plotly.Figure) inseridas depois dos painéis de embedding —
+    usado pelo 7_judge_analysis pra anexar a seção do juiz no mesmo report.
+    `extra_header_html` é inserido antes das extra_figs (ex: '<h2>Juiz</h2>').
+    `extra_meta` é uma linha adicional na header.
     """
     figs = []
     for builder in (fig_means_by_metric, fig_spearman_heatmap,
-                    fig_breakdown_heatmap, fig_completeness):
-        f = builder(report)
-        if f is not None:
-            figs.append(f)
+                    figs_breakdown_heatmaps, fig_completeness):
+        result = builder(report)
+        if result is None:
+            continue
+        if isinstance(result, list):
+            figs.extend(result)
+        else:
+            figs.append(result)
+    n_embed = len(figs)
+
+    if extra_figs:
+        figs.extend(extra_figs)
 
     if not figs:
         raise RuntimeError("report.json não tem dados suficientes para nenhum "
@@ -158,7 +195,6 @@ def build_dashboard(report):
 
     partes = []
     for i, f in enumerate(figs):
-        # só a primeira figura embute a lib plotly.js; as outras reaproveitam
         partes.append(f.to_html(
             full_html=False,
             include_plotlyjs=(True if i == 0 else False),
@@ -166,6 +202,18 @@ def build_dashboard(report):
 
     n_rows = report.get("n_rows", "?")
     metrics = ", ".join(report.get("metrics", []))
+
+    # monta o corpo: painéis de embedding, depois header opcional + extras
+    body_panels = "".join(
+        f'<div class="panel">{partes[i]}</div>' for i in range(n_embed))
+    body_extra = ""
+    if extra_figs:
+        body_extra = (extra_header_html or "") + "".join(
+            f'<div class="panel">{partes[i]}</div>'
+            for i in range(n_embed, len(figs)))
+
+    extra_meta_line = f" &middot; {extra_meta}" if extra_meta else ""
+
     html = f"""<!DOCTYPE html>
 <html lang="pt-br">
 <head>
@@ -175,6 +223,8 @@ def build_dashboard(report):
     body {{ font-family: sans-serif; max-width: 1100px; margin: 0 auto;
             padding: 20px; background: #fafafa; }}
     h1 {{ border-bottom: 2px solid #333; padding-bottom: 8px; }}
+    h2 {{ border-bottom: 1px solid #999; padding-bottom: 6px;
+          margin-top: 36px; color: #333; }}
     .meta {{ color: #666; margin-bottom: 24px; }}
     .panel {{ background: white; border: 1px solid #ddd; border-radius: 6px;
               margin-bottom: 20px; padding: 10px; }}
@@ -185,15 +235,16 @@ def build_dashboard(report):
 <body>
   <h1>MedPT — Benchmark de modelos médicos (PT-BR)</h1>
   <div class="meta">
-    {n_rows} linhas pontuadas &middot; métricas: {metrics}
+    {n_rows} linhas pontuadas &middot; métricas: {metrics}{extra_meta_line}
   </div>
-  {"".join(f'<div class="panel">{p}</div>' for p in partes)}
+  <h2>Métricas de embedding (proximidade à referência)</h2>
+  {body_panels}
+  {body_extra}
   <div class="nota">
-    <strong>Lembrete metodológico:</strong> estas métricas medem proximidade
-    à resposta de referência do MedPT, não qualidade clínica absoluta. O MedPT
-    é Q&amp;A de fórum — a referência é uma resposta humana entre várias
-    possíveis. Para conclusões fortes, valide o ranking com o LLM-as-judge
-    (6_llm_judge.py) num subconjunto.
+    <strong>Lembrete metodológico:</strong> as métricas de embedding medem
+    proximidade à resposta de referência do MedPT, não qualidade clínica
+    absoluta. O LLM-as-judge (quando presente) dá uma segunda opinião baseada
+    em coerência clínica e cobertura.
   </div>
 </body>
 </html>"""

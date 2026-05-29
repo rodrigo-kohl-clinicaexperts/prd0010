@@ -10,7 +10,7 @@ from scipy.stats import spearmanr
 DATA = Path(__file__).parent / "data"
 
 # métricas onde "maior = melhor"
-METRICS = ["bge_dense", "bge_sparse", "e5_dense", "bertscore_f1"]
+METRICS = ["bge_dense", "bge_sparse", "e5_dense", "bge_colbert_f1"]
 
 
 def load_scores():
@@ -149,47 +149,56 @@ def print_metric_agreement(rankings):
     return pares
 
 
-def print_by_question_type(rows, qtype_by_id, primary_metric):
-    """Quebra por question_type — coluna limpa, 7 valores."""
+def compute_breakdowns_by_metric(rows, qtype_by_id, metrics, primary_metric):
+    """
+    Quebra por question_type para TODAS as métricas. Devolve:
+      {metric: {qtype: {model: mean_score}}}
+    Imprime no console só a métrica primária pra não virar muralha de texto.
+    """
     print("\n" + "=" * 70)
-    print(f"QUEBRA POR QUESTION_TYPE (métrica: {primary_metric})")
+    print(f"QUEBRA POR QUESTION_TYPE (impresso: {primary_metric} — "
+          f"as outras métricas vão no report.json)")
     print("=" * 70)
 
     if not qtype_by_id:
         print("  (eval_set.parquet não encontrado — pulando quebra por tipo)")
         return {}
 
-    # acc[tipo][modelo] = lista de scores
-    acc = defaultdict(lambda: defaultdict(list))
-    type_counts = defaultdict(int)
+    # acc[metric][qtype][model] = lista de scores
+    acc = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    type_counts = defaultdict(int)  # contado uma vez (independe da métrica)
     for r in rows:
-        if primary_metric not in r:
-            continue
         qt = qtype_by_id.get(r["id"], "?")
-        acc[qt][r["model"]].append(r[primary_metric])
         type_counts[qt] += 1
+        for metric in metrics:
+            if metric in r:
+                acc[metric][qt][r["model"]].append(r[metric])
 
     models = sorted({r["model"] for r in rows})
-    # ordena os tipos por frequência (maior primeiro)
     types_sorted = sorted(type_counts, key=lambda t: -type_counts[t])
 
+    breakdowns = {}
+    for metric in metrics:
+        breakdowns[metric] = {}
+        for qt in types_sorted:
+            breakdowns[metric][qt] = {}
+            for model in models:
+                vals = acc[metric][qt][model]
+                if vals:
+                    breakdowns[metric][qt][model] = float(np.mean(vals))
+
+    # console: só a primária
     header = f"{'question_type':<32}" + "".join(f"{m:>16}" for m in models)
     print(header)
     print("-" * len(header))
-    breakdown = {}
     for qt in types_sorted:
         line = f"{str(qt)[:31]:<32}"
-        breakdown[qt] = {}
         for model in models:
-            vals = acc[qt][model]
-            if vals:
-                mean_v = float(np.mean(vals))
-                line += f"{mean_v:>16.4f}"
-                breakdown[qt][model] = mean_v
-            else:
-                line += f"{'—':>16}"
+            v = breakdowns.get(primary_metric, {}).get(qt, {}).get(model)
+            line += f"{v:>16.4f}" if v is not None else f"{'—':>16}"
         print(line)
-    return breakdown
+
+    return breakdowns
 
 
 def collect_audit_info(rows):
@@ -221,9 +230,10 @@ def main(args):
     qtype_by_id = load_question_types()
     primary = "bge_dense" if "bge_dense" in present_metrics else (
         present_metrics[0] if present_metrics else None)
-    breakdown = {}
+    breakdowns = {}
     if primary:
-        breakdown = print_by_question_type(rows, qtype_by_id, primary)
+        breakdowns = compute_breakdowns_by_metric(
+            rows, qtype_by_id, present_metrics, primary)
 
     config_hashes, providers = collect_audit_info(rows)
 
@@ -232,10 +242,11 @@ def main(args):
         "n_rows": len(rows),
         "n_by_model": dict(counts),
         "metrics": present_metrics,
+        "primary_metric": primary,
         "means_by_metric": means_by_metric,
         "rankings": rankings,
         "metric_agreement_spearman": agreement,
-        "breakdown_by_question_type": breakdown,
+        "breakdowns_by_metric": breakdowns,
         "audit": {
             "config_hash_by_model": config_hashes,
             "provider_used_by_model": providers,
